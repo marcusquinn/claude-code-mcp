@@ -76,11 +76,31 @@ interface ClaudeCliResponse {
 
 /**
  * Session mapping: parentSessionId -> claudeCliSessionId
+ * Limited to MAX_SESSIONS to prevent memory leaks in long-running servers
  */
+const MAX_SESSIONS = 1000;
 const sessionMap = new Map<string, string>();
 
 /**
- * Determine the Claude CLI command/path.
+ * Store a session mapping with LRU-style eviction
+ */
+function setSessionMapping(parentId: string, claudeId: string): void {
+  if (sessionMap.size >= MAX_SESSIONS) {
+    // Remove oldest entry (first inserted)
+    const firstKey = sessionMap.keys().next().value;
+    if (firstKey) sessionMap.delete(firstKey);
+  }
+  sessionMap.set(parentId, claudeId);
+}
+
+/**
+ * Determines the Claude CLI command/path based on the following precedence:
+ * 1. An absolute path specified in the `CLAUDE_CLI_NAME` environment variable.
+ * 2. The local user installation at `~/.claude/local/claude`.
+ * 3. A simple command name from `CLAUDE_CLI_NAME` (looked up in the system's PATH).
+ * 4. The default command `claude` (looked up in the system's PATH).
+ *
+ * Note: Relative paths in `CLAUDE_CLI_NAME` are not allowed and will cause an error.
  */
 export function findClaudeCli(): string {
   debugLog('[Debug] Attempting to find Claude CLI...');
@@ -132,20 +152,41 @@ function formatConversationContext(messages: ConversationMessage[]): string {
 
 /**
  * Translate slash commands to @ mentions for Claude Code subagent invocation
+ * Only matches /command patterns that don't look like file paths (no / after the command name)
  */
 function translateSlashCommands(prompt: string): string {
-  return prompt.replace(/^\/([a-zA-Z][a-zA-Z0-9_-]*)/gm, '@$1');
+  // Match /command at start of line, but only if followed by space, end of line, or end of string
+  // This avoids matching file paths like /tmp/foo or /usr/bin/something
+  return prompt.replace(/^\/([a-zA-Z][a-zA-Z0-9_-]*)(?=\s|$)/gm, '@$1');
 }
 
 /**
  * Parse Claude CLI JSON response
+ * Handles both clean JSON output and output with extra text
  */
 function parseClaudeResponse(stdout: string): ClaudeCliResponse | null {
   try {
-    const jsonMatch = stdout.match(/\{[\s\S]*"type"\s*:\s*"result"[\s\S]*\}/);
-    if (jsonMatch) {
-      return JSON.parse(jsonMatch[0]);
+    // Try parsing the entire stdout first (most common case with --output-format json)
+    const trimmed = stdout.trim();
+    if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+      const parsed = JSON.parse(trimmed);
+      if (parsed.type === 'result') return parsed;
     }
+    
+    // Fallback: try to find a JSON object line by line
+    const lines = stdout.split('\n');
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i].trim();
+      if (line.startsWith('{') && line.endsWith('}')) {
+        try {
+          const parsed = JSON.parse(line);
+          if (parsed.type === 'result') return parsed;
+        } catch {
+          // Continue to next line
+        }
+      }
+    }
+    
     return null;
   } catch (e) {
     debugLog('[Debug] Failed to parse Claude CLI JSON response:', e);
@@ -332,7 +373,28 @@ export class ClaudeCodeServer {
       ) {
         prompt = toolArguments.prompt;
       } else {
-        throw new McpError(ErrorCode.InvalidParams, 'Missing or invalid required parameter: prompt');
+        throw new McpError(ErrorCode.InvalidParams, 'Missing or invalid required parameter: "prompt" must be a string.');
+      }
+
+      // Validate optional sessionId
+      const sessionId = toolArguments.sessionId;
+      if (sessionId !== undefined && typeof sessionId !== 'string') {
+        throw new McpError(ErrorCode.InvalidParams, 'Invalid parameter: "sessionId" must be a string if provided.');
+      }
+
+      // Validate optional messages array
+      const messages = toolArguments.messages;
+      if (messages !== undefined) {
+        if (!Array.isArray(messages)) {
+          throw new McpError(ErrorCode.InvalidParams, 'Invalid parameter: "messages" must be an array if provided.');
+        }
+        for (const msg of messages) {
+          if (typeof msg !== 'object' || msg === null || 
+              typeof msg.role !== 'string' || typeof msg.content !== 'string' ||
+              (msg.role !== 'user' && msg.role !== 'assistant')) {
+            throw new McpError(ErrorCode.InvalidParams, 'Invalid parameter: each message must have "role" (user|assistant) and "content" (string).');
+          }
+        }
       }
 
       let effectiveCwd = homedir();
@@ -360,8 +422,9 @@ export class ClaudeCodeServer {
           isFirstToolUse = false;
         }
 
-        const parentSessionId = toolArguments.sessionId as string | undefined;
-        const messages = toolArguments.messages as ConversationMessage[] | undefined;
+        // Use already-validated values
+        const parentSessionId = sessionId;
+        const validatedMessages = messages as ConversationMessage[] | undefined;
         const stateless = toolArguments.stateless === true;
 
         let processedPrompt = translateSlashCommands(prompt);
@@ -374,9 +437,9 @@ export class ClaudeCodeServer {
           if (existingClaudeSessionId) {
             debugLog(`[Debug] Resuming Claude CLI session: ${existingClaudeSessionId} for parent session: ${parentSessionId}`);
             claudeProcessArgs.push('--resume', existingClaudeSessionId);
-          } else if (messages && messages.length > 0) {
-            debugLog(`[Debug] First call for parent session: ${parentSessionId}, injecting ${messages.length} messages as context`);
-            const contextPrefix = formatConversationContext(messages);
+          } else if (validatedMessages && validatedMessages.length > 0) {
+            debugLog(`[Debug] First call for parent session: ${parentSessionId}, injecting ${validatedMessages.length} messages as context`);
+            const contextPrefix = formatConversationContext(validatedMessages);
             processedPrompt = contextPrefix + 'Continue the conversation. ' + processedPrompt;
           }
         }
@@ -407,7 +470,7 @@ export class ClaudeCodeServer {
           claudeSessionId = parsedResponse.session_id;
           
           if (!stateless && parentSessionId && claudeSessionId) {
-            sessionMap.set(parentSessionId, claudeSessionId);
+            setSessionMapping(parentSessionId, claudeSessionId);
             debugLog(`[Debug] Stored session mapping: ${parentSessionId} -> ${claudeSessionId}`);
           }
 

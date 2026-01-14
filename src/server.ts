@@ -35,29 +35,65 @@ export function debugLog(message?: any, ...optionalParams: any[]): void {
 }
 
 /**
+ * Message format for conversation context
+ */
+interface ConversationMessage {
+  role: 'user' | 'assistant';
+  content: string;
+}
+
+/**
+ * Extended interface for Claude Code tool arguments with session support
+ */
+interface ClaudeCodeArgs {
+  prompt: string;
+  workFolder?: string;
+  sessionId?: string;
+  messages?: ConversationMessage[];
+  stateless?: boolean;
+}
+
+/**
+ * Claude CLI JSON output format
+ */
+interface ClaudeCliResponse {
+  type: string;
+  subtype: string;
+  is_error: boolean;
+  duration_ms: number;
+  duration_api_ms?: number;
+  num_turns?: number;
+  result: string;
+  session_id: string;
+  total_cost_usd?: number;
+  usage?: {
+    input_tokens: number;
+    output_tokens: number;
+    cache_creation_input_tokens?: number;
+    cache_read_input_tokens?: number;
+  };
+}
+
+/**
+ * Session mapping: parentSessionId -> claudeCliSessionId
+ */
+const sessionMap = new Map<string, string>();
+
+/**
  * Determine the Claude CLI command/path.
- * 1. Checks for CLAUDE_CLI_NAME environment variable:
- *    - If absolute path, uses it directly
- *    - If relative path, throws error
- *    - If simple name, continues with path resolution
- * 2. Checks for Claude CLI at the local user path: ~/.claude/local/claude.
- * 3. If not found, defaults to the CLI name (or 'claude'), relying on the system's PATH for lookup.
  */
 export function findClaudeCli(): string {
   debugLog('[Debug] Attempting to find Claude CLI...');
 
-  // Check for custom CLI name from environment variable
   const customCliName = process.env.CLAUDE_CLI_NAME;
   if (customCliName) {
     debugLog(`[Debug] Using custom Claude CLI name from CLAUDE_CLI_NAME: ${customCliName}`);
     
-    // If it's an absolute path, use it directly
     if (path.isAbsolute(customCliName)) {
       debugLog(`[Debug] CLAUDE_CLI_NAME is an absolute path: ${customCliName}`);
       return customCliName;
     }
     
-    // If it starts with ~ or ./, reject as relative paths are not allowed
     if (customCliName.startsWith('./') || customCliName.startsWith('../') || customCliName.includes('/')) {
       throw new Error(`Invalid CLAUDE_CLI_NAME: Relative paths are not allowed. Use either a simple name (e.g., 'claude') or an absolute path (e.g., '/tmp/claude-test')`);
     }
@@ -65,7 +101,6 @@ export function findClaudeCli(): string {
   
   const cliName = customCliName || 'claude';
 
-  // Try local install path: ~/.claude/local/claude (using the original name for local installs)
   const userPath = join(homedir(), '.claude', 'local', 'claude');
   debugLog(`[Debug] Checking for Claude CLI at local user path: ${userPath}`);
 
@@ -76,26 +111,53 @@ export function findClaudeCli(): string {
     debugLog(`[Debug] Claude CLI not found at local user path: ${userPath}.`);
   }
 
-  // 3. Fallback to CLI name (PATH lookup)
   debugLog(`[Debug] Falling back to "${cliName}" command name, relying on spawn/PATH lookup.`);
   console.warn(`[Warning] Claude CLI not found at ~/.claude/local/claude. Falling back to "${cliName}" in PATH. Ensure it is installed and accessible.`);
   return cliName;
 }
 
 /**
- * Interface for Claude Code tool arguments
+ * Format conversation messages into a context string for Claude CLI
  */
-interface ClaudeCodeArgs {
-  prompt: string;
-  workFolder?: string;
+function formatConversationContext(messages: ConversationMessage[]): string {
+  if (!messages || messages.length === 0) return '';
+  
+  const formatted = messages.map(msg => {
+    const roleLabel = msg.role === 'user' ? 'User' : 'Assistant';
+    return `[${roleLabel}]: ${msg.content}`;
+  }).join('\n\n');
+  
+  return `<conversation_context>\n${formatted}\n</conversation_context>\n\n`;
 }
 
-// Ensure spawnAsync is defined correctly *before* the class
+/**
+ * Translate slash commands to @ mentions for Claude Code subagent invocation
+ */
+function translateSlashCommands(prompt: string): string {
+  return prompt.replace(/^\/([a-zA-Z][a-zA-Z0-9_-]*)/gm, '@$1');
+}
+
+/**
+ * Parse Claude CLI JSON response
+ */
+function parseClaudeResponse(stdout: string): ClaudeCliResponse | null {
+  try {
+    const jsonMatch = stdout.match(/\{[\s\S]*"type"\s*:\s*"result"[\s\S]*\}/);
+    if (jsonMatch) {
+      return JSON.parse(jsonMatch[0]);
+    }
+    return null;
+  } catch (e) {
+    debugLog('[Debug] Failed to parse Claude CLI JSON response:', e);
+    return null;
+  }
+}
+
 export async function spawnAsync(command: string, args: string[], options?: { timeout?: number, cwd?: string }): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
     debugLog(`[Spawn] Running command: ${command} ${args.join(' ')}`);
     const process = spawn(command, args, {
-      shell: false, // Reverted to false
+      shell: false,
       timeout: options?.timeout,
       cwd: options?.cwd,
       stdio: ['ignore', 'pipe', 'pipe']
@@ -137,17 +199,15 @@ export async function spawnAsync(command: string, args: string[], options?: { ti
 }
 
 /**
- * MCP Server for Claude Code
- * Provides a simple MCP tool to run Claude CLI in one-shot mode
+ * MCP Server for Claude Code with Session Continuity
  */
 export class ClaudeCodeServer {
   private server: Server;
-  private claudeCliPath: string; // This now holds either a full path or just 'claude'
-  private packageVersion: string; // Add packageVersion property
+  private claudeCliPath: string;
+  private packageVersion: string;
 
   constructor() {
-    // Use the simplified findClaudeCli function
-    this.claudeCliPath = findClaudeCli(); // Removed debugMode argument
+    this.claudeCliPath = findClaudeCli();
     console.error(`[Setup] Using Claude CLI command/path: ${this.claudeCliPath}`);
     this.packageVersion = SERVER_VERSION;
 
@@ -172,59 +232,77 @@ export class ClaudeCodeServer {
     });
   }
 
-  /**
-   * Set up the MCP tool handlers
-   */
   private setupToolHandlers(): void {
-    // Define available tools
     this.server.setRequestHandler(ListToolsRequestSchema, async () => ({
       tools: [
         {
           name: 'claude_code',
-          description: `Claude Code Agent: Your versatile multi-modal assistant for code, file, Git, and terminal operations via Claude CLI. Use \`workFolder\` for contextual execution.
+          description: `Claude Code Agent with Session Continuity: Multi-modal assistant for code, file, Git, and terminal operations via Claude CLI.
 
-• File ops: Create, read, (fuzzy) edit, move, copy, delete, list files, analyze/ocr images, file content analysis
-    └─ e.g., "Create /tmp/log.txt with 'system boot'", "Edit main.py to replace 'debug_mode = True' with 'debug_mode = False'", "List files in /src", "Move a specific section somewhere else"
+**Session Continuity** (Default behavior):
+- Pass \`sessionId\` from your parent interface to maintain conversation context
+- First call: optionally include \`messages\` array with conversation history
+- Subsequent calls: just pass \`sessionId\` and \`prompt\` - context is maintained
+- Response includes session ID for tracking
 
-• Code: Generate / analyse / refactor / fix
-    └─ e.g. "Generate Python to parse CSV→JSON", "Find bugs in my_script.py"
+**Subagent Invocation**:
+- Use \`/commandname\` in prompts to invoke Claude Code subagents (translated to @mentions)
 
-• Git: Stage ▸ commit ▸ push ▸ tag (any workflow)
-    └─ "Commit '/workspace/src/main.java' with 'feat: user auth' to develop."
+**Stateless Mode** (Legacy):
+- Set \`stateless: true\` for single-prompt behavior without session tracking
 
-• Terminal: Run any CLI cmd or open URLs
-    └─ "npm run build", "Open https://developer.mozilla.org"
+**Capabilities**:
+• File ops: Create, read, edit, move, copy, delete, list, analyze images
+• Code: Generate, analyze, refactor, fix bugs
+• Git: Stage, commit, push, tag, create PRs
+• Terminal: Run CLI commands, open URLs
+• Web search + summarization
+• Multi-step workflows
 
-• Web search + summarise content on-the-fly
-
-• Multi-step workflows  (Version bumps, changelog updates, release tagging, etc.)
-
-• GitHub integration  Create PRs, check CI status
-
-• Confused or stuck on an issue? Ask Claude Code for a second opinion, it might surprise you!
-
-**Prompt tips**
-
-1. Be concise, explicit & step-by-step for complex tasks. No need for niceties, this is a tool to get things done.
-2. For multi-line text, write it to a temporary file in the project root, use that file, then delete it.
-3. If you get a timeout, split the task into smaller steps.
-4. **Seeking a second opinion/analysis**: If you're stuck or want advice, you can ask \`claude_code\` to analyze a problem and suggest solutions. Clearly state in your prompt that you are looking for analysis only and no actual file modifications should be made.
-5. If workFolder is set to the project path, there is no need to repeat that path in the prompt and you can use relative paths for files.
-6. Claude Code is really good at complex multi-step file operations and refactorings and faster than your native edit features.
-7. Combine file operations, README updates, and Git commands in a sequence.
-8. Claude can do much more, just ask it!
-
-        `,
+**Tips**:
+1. Be concise and explicit for complex tasks
+2. Use \`workFolder\` for file operations
+3. For long tasks, split into smaller steps
+4. Combine operations in sequences for efficiency
+`,
           inputSchema: {
             type: 'object',
             properties: {
               prompt: {
                 type: 'string',
-                description: 'The detailed natural language prompt for Claude to execute.',
+                description: 'The message or prompt for Claude to process.',
               },
               workFolder: {
                 type: 'string',
-                description: 'Mandatory when using file operations or referencing any file. The working directory for the Claude CLI execution. Must be an absolute path.',
+                description: 'Working directory for file operations. Must be an absolute path.',
+              },
+              sessionId: {
+                type: 'string',
+                description: 'Session ID from the parent interface. Enables conversation continuity - subsequent calls with the same sessionId will resume the Claude Code session.',
+              },
+              messages: {
+                type: 'array',
+                description: 'Full conversation history from the parent interface. Only needed on the first call - subsequent calls use sessionId for continuity.',
+                items: {
+                  type: 'object',
+                  properties: {
+                    role: {
+                      type: 'string',
+                      enum: ['user', 'assistant'],
+                      description: 'The role of the message sender.',
+                    },
+                    content: {
+                      type: 'string',
+                      description: 'The message content.',
+                    },
+                  },
+                  required: ['role', 'content'],
+                },
+              },
+              stateless: {
+                type: 'boolean',
+                description: 'Force single-prompt mode without session continuity. Default is false (sessions enabled).',
+                default: false,
               },
             },
             required: ['prompt'],
@@ -233,20 +311,16 @@ export class ClaudeCodeServer {
       ],
     }));
 
-    // Handle tool calls
     const executionTimeoutMs = 1800000; // 30 minutes timeout
 
     this.server.setRequestHandler(CallToolRequestSchema, async (args, call): Promise<ServerResult> => {
       debugLog('[Debug] Handling CallToolRequest:', args);
 
-      // Correctly access toolName from args.params.name
       const toolName = args.params.name;
       if (toolName !== 'claude_code') {
-        // ErrorCode.ToolNotFound should be ErrorCode.MethodNotFound as per SDK for tools
         throw new McpError(ErrorCode.MethodNotFound, `Tool ${toolName} not found`);
       }
 
-      // Robustly access prompt from args.params.arguments
       const toolArguments = args.params.arguments;
       let prompt: string;
 
@@ -258,18 +332,15 @@ export class ClaudeCodeServer {
       ) {
         prompt = toolArguments.prompt;
       } else {
-        throw new McpError(ErrorCode.InvalidParams, 'Missing or invalid required parameter: prompt (must be an object with a string "prompt" property) for claude_code tool');
+        throw new McpError(ErrorCode.InvalidParams, 'Missing or invalid required parameter: prompt');
       }
 
-      // Determine the working directory
-      let effectiveCwd = homedir(); // Default CWD is user's home directory
+      let effectiveCwd = homedir();
 
-      // Check if workFolder is provided in the tool arguments
       if (toolArguments.workFolder && typeof toolArguments.workFolder === 'string') {
         const resolvedCwd = pathResolve(toolArguments.workFolder);
         debugLog(`[Debug] Specified workFolder: ${toolArguments.workFolder}, Resolved to: ${resolvedCwd}`);
 
-        // Check if the resolved path exists
         if (existsSync(resolvedCwd)) {
           effectiveCwd = resolvedCwd;
           debugLog(`[Debug] Using workFolder as CWD: ${effectiveCwd}`);
@@ -283,19 +354,41 @@ export class ClaudeCodeServer {
       try {
         debugLog(`[Debug] Attempting to execute Claude CLI with prompt: "${prompt}" in CWD: "${effectiveCwd}"`);
 
-        // Print tool info on first use
         if (isFirstToolUse) {
           const versionInfo = `claude_code v${SERVER_VERSION} started at ${serverStartupTime}`;
           console.error(versionInfo);
           isFirstToolUse = false;
         }
 
-        const claudeProcessArgs = ['--dangerously-skip-permissions', '-p', prompt];
+        const parentSessionId = toolArguments.sessionId as string | undefined;
+        const messages = toolArguments.messages as ConversationMessage[] | undefined;
+        const stateless = toolArguments.stateless === true;
+
+        let processedPrompt = translateSlashCommands(prompt);
+
+        const claudeProcessArgs: string[] = ['--dangerously-skip-permissions'];
+
+        if (!stateless && parentSessionId) {
+          const existingClaudeSessionId = sessionMap.get(parentSessionId);
+          
+          if (existingClaudeSessionId) {
+            debugLog(`[Debug] Resuming Claude CLI session: ${existingClaudeSessionId} for parent session: ${parentSessionId}`);
+            claudeProcessArgs.push('--resume', existingClaudeSessionId);
+          } else if (messages && messages.length > 0) {
+            debugLog(`[Debug] First call for parent session: ${parentSessionId}, injecting ${messages.length} messages as context`);
+            const contextPrefix = formatConversationContext(messages);
+            processedPrompt = contextPrefix + 'Continue the conversation. ' + processedPrompt;
+          }
+        }
+
+        claudeProcessArgs.push('--output-format', 'json');
+        claudeProcessArgs.push('-p', processedPrompt);
+
         debugLog(`[Debug] Invoking Claude CLI: ${this.claudeCliPath} ${claudeProcessArgs.join(' ')}`);
 
         const { stdout, stderr } = await spawnAsync(
-          this.claudeCliPath, // Run the Claude CLI directly
-          claudeProcessArgs, // Pass the arguments
+          this.claudeCliPath,
+          claudeProcessArgs,
           { timeout: executionTimeoutMs, cwd: effectiveCwd }
         );
 
@@ -304,13 +397,47 @@ export class ClaudeCodeServer {
           debugLog('[Debug] Claude CLI stderr:', stderr.trim());
         }
 
-        // Return stdout content, even if there was stderr, as claude-cli might output main result to stdout.
-        return { content: [{ type: 'text', text: stdout }] };
+        const parsedResponse = parseClaudeResponse(stdout);
+        
+        let resultText: string;
+        let claudeSessionId: string | undefined;
+
+        if (parsedResponse) {
+          resultText = parsedResponse.result;
+          claudeSessionId = parsedResponse.session_id;
+          
+          if (!stateless && parentSessionId && claudeSessionId) {
+            sessionMap.set(parentSessionId, claudeSessionId);
+            debugLog(`[Debug] Stored session mapping: ${parentSessionId} -> ${claudeSessionId}`);
+          }
+
+          if (parsedResponse.usage) {
+            debugLog(`[Debug] Token usage - Input: ${parsedResponse.usage.input_tokens}, Output: ${parsedResponse.usage.output_tokens}`);
+          }
+          if (parsedResponse.total_cost_usd !== undefined) {
+            debugLog(`[Debug] Cost: $${parsedResponse.total_cost_usd.toFixed(4)}`);
+          }
+        } else {
+          resultText = stdout;
+          debugLog('[Debug] Could not parse JSON response, using raw stdout');
+        }
+
+        const responseContent: { type: 'text'; text: string }[] = [
+          { type: 'text', text: resultText }
+        ];
+
+        if (!stateless && claudeSessionId) {
+          responseContent.push({
+            type: 'text',
+            text: `\n---\n_Session ID: ${claudeSessionId}_`
+          });
+        }
+
+        return { content: responseContent };
 
       } catch (error: any) {
         debugLog('[Error] Error executing Claude CLI:', error);
         let errorMessage = error.message || 'Unknown error';
-        // Attempt to include stderr and stdout from the error object if spawnAsync attached them
         if (error.stderr) {
           errorMessage += `\nStderr: ${error.stderr}`;
         }
@@ -319,26 +446,19 @@ export class ClaudeCodeServer {
         }
 
         if (error.signal === 'SIGTERM' || (error.message && error.message.includes('ETIMEDOUT')) || (error.code === 'ETIMEDOUT')) {
-          // Reverting to InternalError due to lint issues, but with a specific timeout message.
           throw new McpError(ErrorCode.InternalError, `Claude CLI command timed out after ${executionTimeoutMs / 1000}s. Details: ${errorMessage}`);
         }
-        // ErrorCode.ToolCallFailed should be ErrorCode.InternalError or a more specific execution error if available
         throw new McpError(ErrorCode.InternalError, `Claude CLI execution failed: ${errorMessage}`);
       }
     });
   }
 
-  /**
-   * Start the MCP server
-   */
   async run(): Promise<void> {
-    // Revert to original server start logic if listen caused errors
     const transport = new StdioServerTransport();
     await this.server.connect(transport);
     console.error('Claude Code MCP server running on stdio');
   }
 }
 
-// Create and run the server if this is the main module
 const server = new ClaudeCodeServer();
 server.run().catch(console.error);

@@ -9,11 +9,10 @@ import {
   type ServerResult,
 } from '@modelcontextprotocol/sdk/types.js';
 import { spawn } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve as pathResolve } from 'node:path';
 import * as path from 'path';
-import { readFileSync } from 'node:fs';
 
 // Server version - update this when releasing new versions
 const SERVER_VERSION = "1.10.12";
@@ -75,23 +74,131 @@ interface ClaudeCliResponse {
 }
 
 /**
- * Session mapping: parentSessionId -> claudeCliSessionId
- * Limited to MAX_SESSIONS to prevent memory leaks in long-running servers
+ * Session entry with timestamp for expiration
  */
-const MAX_SESSIONS = 1000;
-const sessionMap = new Map<string, string>();
+interface SessionEntry {
+  claudeSessionId: string;
+  updatedAt: string;
+}
 
 /**
- * Store a session mapping with LRU-style eviction
+ * Session storage configuration
+ */
+const MAX_SESSIONS = 1000;
+const SESSION_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+const SESSION_DIR = join(homedir(), '.config', 'claude-code-mcp');
+const SESSION_FILE = join(SESSION_DIR, 'sessions.json');
+
+/**
+ * In-memory session cache, loaded from file on startup
+ */
+let sessionMap: Map<string, SessionEntry> = new Map();
+
+/**
+ * Ensure the session directory exists
+ */
+function ensureSessionDir(): void {
+  if (!existsSync(SESSION_DIR)) {
+    mkdirSync(SESSION_DIR, { recursive: true });
+    debugLog(`[Debug] Created session directory: ${SESSION_DIR}`);
+  }
+}
+
+/**
+ * Load sessions from file into memory
+ */
+function loadSessions(): void {
+  try {
+    if (existsSync(SESSION_FILE)) {
+      const data = readFileSync(SESSION_FILE, 'utf-8');
+      const parsed = JSON.parse(data);
+      sessionMap = new Map(Object.entries(parsed));
+      debugLog(`[Debug] Loaded ${sessionMap.size} sessions from ${SESSION_FILE}`);
+      
+      // Clean up expired sessions on load
+      cleanExpiredSessions();
+    }
+  } catch (e) {
+    debugLog('[Debug] Failed to load sessions file, starting fresh:', e);
+    sessionMap = new Map();
+  }
+}
+
+/**
+ * Save sessions from memory to file
+ */
+function saveSessions(): void {
+  try {
+    ensureSessionDir();
+    const data = Object.fromEntries(sessionMap);
+    writeFileSync(SESSION_FILE, JSON.stringify(data, null, 2));
+    debugLog(`[Debug] Saved ${sessionMap.size} sessions to ${SESSION_FILE}`);
+  } catch (e) {
+    debugLog('[Debug] Failed to save sessions file:', e);
+  }
+}
+
+/**
+ * Remove sessions older than TTL
+ */
+function cleanExpiredSessions(): void {
+  const now = Date.now();
+  let cleaned = 0;
+  
+  for (const [parentId, entry] of sessionMap) {
+    const age = now - new Date(entry.updatedAt).getTime();
+    if (age > SESSION_TTL_MS) {
+      sessionMap.delete(parentId);
+      cleaned++;
+    }
+  }
+  
+  if (cleaned > 0) {
+    debugLog(`[Debug] Cleaned ${cleaned} expired sessions`);
+    saveSessions();
+  }
+}
+
+/**
+ * Get a session mapping
+ */
+function getSessionMapping(parentId: string): string | undefined {
+  const entry = sessionMap.get(parentId);
+  if (entry) {
+    // Check if expired
+    const age = Date.now() - new Date(entry.updatedAt).getTime();
+    if (age > SESSION_TTL_MS) {
+      sessionMap.delete(parentId);
+      saveSessions();
+      return undefined;
+    }
+    return entry.claudeSessionId;
+  }
+  return undefined;
+}
+
+/**
+ * Store a session mapping with LRU-style eviction and file persistence
  */
 function setSessionMapping(parentId: string, claudeId: string): void {
+  // LRU eviction if at capacity
   if (sessionMap.size >= MAX_SESSIONS) {
     // Remove oldest entry (first inserted)
     const firstKey = sessionMap.keys().next().value;
     if (firstKey) sessionMap.delete(firstKey);
   }
-  sessionMap.set(parentId, claudeId);
+  
+  sessionMap.set(parentId, {
+    claudeSessionId: claudeId,
+    updatedAt: new Date().toISOString()
+  });
+  
+  // Persist to file
+  saveSessions();
 }
+
+// Load sessions on module initialization
+loadSessions();
 
 /**
  * Determines the Claude CLI command/path based on the following precedence:
@@ -432,7 +539,7 @@ export class ClaudeCodeServer {
         const claudeProcessArgs: string[] = ['--dangerously-skip-permissions'];
 
         if (!stateless && parentSessionId) {
-          const existingClaudeSessionId = sessionMap.get(parentSessionId);
+          const existingClaudeSessionId = getSessionMapping(parentSessionId);
           
           if (existingClaudeSessionId) {
             debugLog(`[Debug] Resuming Claude CLI session: ${existingClaudeSessionId} for parent session: ${parentSessionId}`);
